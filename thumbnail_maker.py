@@ -4,7 +4,8 @@ import os
 import logging
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
-import threading
+from queue import Queue
+from threading import Thread
 
 import PIL
 from PIL import Image
@@ -17,22 +18,23 @@ class ThumbnailMakerService(object):
         self.home_dir = home_dir
         self.input_dir = self.home_dir + os.path.sep + 'incoming'
         self.output_dir = self.home_dir + os.path.sep + 'outgoing'
-        self.download_bytes = 0
-        self.dl_lock = threading.Lock()
-        max_concurrent_dl = 4
-        self.dl_sem = threading.Semaphore(max_concurrent_dl)
+        self.img_queue = Queue()
+        self.dl_queue = Queue()
 
-    def download_image(self, url):
+    def download_image(self):
         """download each image and save to the input dir"""
-        with self.dl_sem:
-            logging.info("downloading images at URL " + url)
-            img_filename = urlparse(url).path.split('/')[-1]
-            dest_path = self.input_dir + os.path.sep + img_filename
-            urlretrieve(url, dest_path)
-            img_size = os.path.getsize(dest_path)
-            with self.dl_lock:
-                self.download_bytes += img_size
-            logging.info("image [{} bytes] saved to {}".format(img_size, dest_path))
+        while not self.dl_queue.empty():
+            try:
+                url = self.dl_queue.get(block=False)
+                img_filename = urlparse(url).path.split('/')[-1]
+                dest_path = self.input_dir + os.path.sep + img_filename
+                urlretrieve(url, dest_path)
+                self.img_queue.put(img_filename)
+                logging.info("downloading images at URL " + url)
+
+                self.dl_queue.task_done()
+            except Queue.Empty:
+                logging.info("Queue empty")
 
     def download_images(self, img_url_list):
         """validate inputs"""
@@ -43,22 +45,19 @@ class ThumbnailMakerService(object):
         logging.info("beginning image downloads")
 
         start = time.perf_counter()
-        threads = []
         for url in img_url_list:
-            t = threading.Thread(target=self.download_image, args=(url,))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
+            img_filename = urlparse(url).path.split('/')[-1]
+            dest_path = self.input_dir + os.path.sep + img_filename
+            urlretrieve(url, dest_path)
+            self.img_queue.put(img_filename)
         end = time.perf_counter()
+
+        self.img_queue.put(None)
 
         logging.info("downloaded {} images in {} seconds".format(len(img_url_list), end - start))
 
     def perform_resizing(self):
         """validate inputs""" 
-        if not os.listdir(self.input_dir):
-            return
         os.makedirs(self.output_dir, exist_ok=True)
 
         logging.info("beginning image resizing")
@@ -66,22 +65,30 @@ class ThumbnailMakerService(object):
         num_images = len(os.listdir(self.input_dir))
 
         start = time.perf_counter()
-        for filename in os.listdir(self.input_dir):
-            orig_img = Image.open(self.input_dir + os.path.sep + filename)
-            for basewidth in target_sizes:
-                img = orig_img
-                # calculate target height of the resized image to maintain the aspect ratio
-                wpercent = (basewidth / float(img.size[0]))
-                hsize = int((float(img.size[1]) * float(wpercent)))
-                # perform resizing
-                img = img.resize((basewidth, hsize), PIL.Image.LANCZOS)
-                
-                # save the resized image to the output dir with a modified file name 
-                new_filename = os.path.splitext(filename)[0] + \
-                    '_' + str(basewidth) + os.path.splitext(filename)[1]
-                img.save(self.output_dir + os.path.sep + new_filename)
+        while True:
+            filename = self.img_queue.get()
+            if filename:
+                logging.info("resizing image {}".format(filename))
+                orig_img = Image.open(self.input_dir + os.path.sep + filename)
+                for basewidth in target_sizes:
+                    img = orig_img
+                    # calculate target height of the resized image to maintain the aspect ratio
+                    wpercent = (basewidth / float(img.size[0]))
+                    hsize = int((float(img.size[1]) * float(wpercent)))
+                    # perform resizing
+                    img = img.resize((basewidth, hsize), PIL.Image.LANCZOS)
 
-            os.remove(self.input_dir + os.path.sep + filename)
+                    # save the resized image to the output dir with a modified file name
+                    new_filename = os.path.splitext(filename)[0] + \
+                        '_' + str(basewidth) + os.path.splitext(filename)[1]
+                    img.save(self.output_dir + os.path.sep + new_filename)
+
+                os.remove(self.input_dir + os.path.sep + filename)
+                logging.info("done resizing image {}".format(filename))
+                self.img_queue.task_done()
+            else:
+                self.img_queue.task_done()
+                break
         end = time.perf_counter()
 
         logging.info("created {} thumbnails in {} seconds".format(num_images, end - start))
@@ -91,8 +98,20 @@ class ThumbnailMakerService(object):
         logging.info("START make_thumbnails")
         start = time.perf_counter()
 
-        self.download_images(img_url_list)
-        #self.perform_resizing()
+        for img_url in img_url_list:
+            self.dl_queue.put(img_url)
+
+        num_dl_threads = 4
+        for _ in range(num_dl_threads):
+            t = Thread(target=self.download_image)
+            t.start()
+
+        t2 = Thread(target=self.perform_resizing)
+        t2.start()
+
+        self.dl_queue.join()
+        self.img_queue.put(None)
+        t2.join()
 
         end = time.perf_counter()
         logging.info("END make_thumbnails in {} seconds".format(end - start))
