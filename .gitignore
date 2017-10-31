@@ -6,3 +6,10 @@ incoming
 outgoing
 staging
 
+.idea/workspace.xml
+.idea/vcs.xml
+.idea/modules.xml
+.idea/python-concurrency-getting-started.iml
+.idea/python-concurrency-getting-started.iml
+.idea/misc.xml
+.gitignore
